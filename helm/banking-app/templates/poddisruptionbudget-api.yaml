@@ -1,0 +1,13 @@
+{{- if .Values.api.podDisruptionBudget.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "banking-app.fullname" . }}-api
+  labels:
+    {{- include "banking-app.componentLabels" (dict "component" "api" "Chart" .Chart "Release" .Release "Values" .Values) | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.api.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "banking-app.componentSelectorLabels" (dict "component" "api" "Chart" .Chart "Release" .Release) | nindent 6 }}
+{{- end -}}

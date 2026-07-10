@@ -1,0 +1,76 @@
+name: Rollback banking-app
+
+# On-demand rollback for the case the deploy pipeline's own two automatic
+# layers don't cover: a release that passed its rollout health check and
+# the post-deploy smoke test, but is later found broken some other way
+# (bad business logic, bad data, a slow leak) and a human decides to revert.
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Helm revision to roll back to. Leave empty for the immediately previous revision."
+        required: false
+        default: ""
+
+# Shares the deploy workflow's concurrency group so a manual rollback can
+# never race an in-flight automated deploy of the same release.
+concurrency:
+  group: deploy-banking-app-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+  HELM_NAMESPACE: banking-app
+  HELM_RELEASE: banking-app
+
+jobs:
+  rollback:
+    name: Helm rollback
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Assume AWS deploy role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Show release history
+        run: helm history "$HELM_RELEASE" -n "$HELM_NAMESPACE"
+
+      # helm rollback restores the *entire* previous release (all values,
+      # not just the image tag) exactly as Helm recorded it - not a
+      # re-deploy with an old tag grafted onto today's config.
+      - name: Roll back
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.revision }}" ]; then
+            helm rollback "$HELM_RELEASE" "${{ inputs.revision }}" -n "$HELM_NAMESPACE" --wait --timeout 5m
+          else
+            helm rollback "$HELM_RELEASE" -n "$HELM_NAMESPACE" --wait --timeout 5m
+          fi
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          kubectl -n "$HELM_NAMESPACE" run "smoke-test-$GITHUB_RUN_ID" \
+            --rm -i --restart=Never --image=curlimages/curl:8.11.1 --command -- \
+            sh -c "
+              for i in \$(seq 1 10); do
+                code=\$(curl -s -o /dev/null -w '%{http_code}' http://${HELM_RELEASE}-api.${HELM_NAMESPACE}.svc.cluster.local/healthz)
+                [ \"\$code\" = \"200\" ] && exit 0
+                sleep 3
+              done
+              exit 1
+            "

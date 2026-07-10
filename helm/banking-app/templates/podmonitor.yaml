@@ -1,0 +1,23 @@
+{{/*
+The consumer has no Service (no inbound traffic besides its own health/
+metrics port), so it's scraped via a PodMonitor rather than a ServiceMonitor.
+*/}}
+{{- if and .Values.consumer.enabled .Values.consumer.serviceMonitor.enabled -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "banking-app.fullname" . }}-consumer
+  labels:
+    {{- include "banking-app.componentLabels" (dict "component" "consumer" "Chart" .Chart "Release" .Release "Values" .Values) | nindent 4 }}
+    {{- with .Values.consumer.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "banking-app.componentSelectorLabels" (dict "component" "consumer" "Chart" .Chart "Release" .Release) | nindent 6 }}
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.consumer.serviceMonitor.interval }}
+{{- end -}}

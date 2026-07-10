@@ -1,0 +1,8 @@
+apiVersion: v2
+name: banking-app
+description: >
+  A minimal request-driven (HTTP API) and event-driven (SQS consumer) banking
+  service backed by Postgres, deployed as two Deployments from one image.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

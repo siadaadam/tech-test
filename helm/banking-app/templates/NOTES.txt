@@ -1,0 +1,30 @@
+banking-app has been deployed.
+
+API:
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "banking-app.fullname" . }}-api {{ .Values.api.service.port }}:{{ .Values.api.service.port }}
+  curl localhost:{{ .Values.api.service.port }}/healthz
+  curl localhost:{{ .Values.api.service.port }}/api/accounts/1
+
+Consumer ({{ if .Values.consumer.enabled }}enabled{{ else }}disabled{{ end }}):
+{{- if .Values.consumer.enabled }}
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=consumer
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=consumer -f
+{{- else }}
+  Set consumer.enabled=true to deploy the event consumer.
+{{- end }}
+
+{{- if not .Values.database.existingSecret }}
+
+WARNING: database.existingSecret is not set, so this release created its own
+Secret from database.url. That's fine for a quick test, but in any real
+environment point database.existingSecret at a Secret populated from the
+Secrets Manager secret produced by terraform/modules/rds (e.g. via External
+Secrets Operator) instead of putting real credentials in values.
+{{- end }}
+
+{{- if or (not .Values.sqs.queueUrl) (not .Values.sqs.dlqUrl) }}
+
+WARNING: sqs.queueUrl / sqs.dlqUrl are not both set. The api will skip
+publishing account.accessed events, and the consumer will fail to start.
+Set them to the queue_url / dlq_url outputs of terraform/modules/sqs.
+{{- end }}

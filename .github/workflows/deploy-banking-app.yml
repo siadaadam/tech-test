@@ -1,0 +1,195 @@
+name: Deploy banking-app
+
+# Runs on every merge to main that touches the app or its chart. Nothing
+# else triggers a deploy: not pull requests, not other branches - the AWS
+# role assumed below (terraform/modules/github-oidc) enforces this too, at
+# the trust-policy level, so it's not just this workflow's own opinion.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "helm/banking-app/**"
+      - ".github/workflows/deploy-banking-app.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-banking-app-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # required to request the OIDC token for AWS federation
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+  HELM_NAMESPACE: banking-app
+  HELM_RELEASE: banking-app
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  test:
+    name: Build, vet, test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: app/go.mod
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  build-scan-push:
+    name: Build, scan, and push image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write # to upload the scan's SARIF to the Security tab
+    steps:
+      - uses: actions/checkout@v4
+
+      # Built (and tagged with the real ECR repository name) but not pushed
+      # yet - nothing below this point touches AWS/ECR until the image has
+      # passed the vulnerability gate, so a bad image never reaches the
+      # registry at all, let alone the cluster.
+      - name: Build image
+        working-directory: app
+        run: |
+          set -euo pipefail
+          docker build \
+            -t "$ECR_REPOSITORY:$IMAGE_TAG" \
+            -t "$ECR_REPOSITORY:latest" \
+            .
+
+      # Pinned by commit SHA (not a mutable tag) since this is a
+      # third-party action running in a job that will go on to request AWS
+      # credentials - see https://docs.github.com/actions/security-guides/security-hardening-for-github-actions
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: "${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          # Don't fail the build over CVEs upstream hasn't shipped a fix
+          # for yet - there's nothing an image rebuild could do about
+          # those, they'd just permanently block every deploy.
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Upload scan results to the Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Assume AWS deploy role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image
+        run: |
+          set -euo pipefail
+          docker push "$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REPOSITORY:latest"
+
+  deploy:
+    name: Helm upgrade
+    needs: build-scan-push
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume AWS deploy role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Render CI values overlay
+        run: |
+          cat > ci-values.yaml <<EOF
+          image:
+            repository: "$ECR_REPOSITORY"
+            tag: "$IMAGE_TAG"
+          database:
+            existingSecret: "${{ vars.DATABASE_SECRET_NAME }}"
+          sqs:
+            queueUrl: "${{ vars.SQS_QUEUE_URL }}"
+            dlqUrl: "${{ vars.SQS_DLQ_URL }}"
+          aws:
+            region: "$AWS_REGION"
+          serviceAccount:
+            annotations:
+              eks.amazonaws.com/role-arn: "${{ vars.APP_IRSA_ROLE_ARN }}"
+          EOF
+
+      - name: Helm lint
+        run: helm lint ./helm/banking-app -f ci-values.yaml
+
+      # --atomic rolls back automatically if the rollout itself never
+      # becomes healthy (readiness probes never pass within --timeout);
+      # --cleanup-on-fail also removes resources the failed release
+      # created, instead of leaving them orphaned. This catches broken
+      # rollouts; it can't catch a release that *becomes* ready but is
+      # wrong in some other way - that's what the smoke test below is for.
+      - name: Helm upgrade --install
+        id: helm_upgrade
+        run: |
+          helm upgrade --install "$HELM_RELEASE" ./helm/banking-app \
+            --namespace "$HELM_NAMESPACE" --create-namespace \
+            -f ci-values.yaml \
+            --wait --timeout 5m --atomic --cleanup-on-fail
+
+      # The Service is ClusterIP-only, so this runner can't reach it
+      # directly even with kubeconfig configured (that only reaches the
+      # API server) - run the check from inside the cluster instead.
+      - name: Smoke test
+        id: smoke_test
+        run: |
+          set -euo pipefail
+          kubectl -n "$HELM_NAMESPACE" run "smoke-test-$GITHUB_RUN_ID" \
+            --rm -i --restart=Never --image=curlimages/curl:8.11.1 --command -- \
+            sh -c "
+              for i in \$(seq 1 10); do
+                code=\$(curl -s -o /dev/null -w '%{http_code}' http://${HELM_RELEASE}-api.${HELM_NAMESPACE}.svc.cluster.local/healthz)
+                [ \"\$code\" = \"200\" ] && exit 0
+                sleep 3
+              done
+              exit 1
+            "
+
+      # Only runs when the upgrade itself succeeded but the smoke test
+      # afterward failed - if the upgrade step failed, --atomic already
+      # handled rollback and there's nothing left to roll back here.
+      - name: Roll back on smoke test failure
+        if: ${{ failure() && steps.helm_upgrade.outcome == 'success' }}
+        run: |
+          echo "::error::Smoke test failed after a healthy-looking rollout - rolling back to the previous release"
+          helm rollback "$HELM_RELEASE" -n "$HELM_NAMESPACE" --wait --timeout 5m
+          exit 1

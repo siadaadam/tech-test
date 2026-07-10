@@ -1,0 +1,60 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: banking
+      POSTGRES_PASSWORD: banking
+      POSTGRES_DB: banking
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U banking -d banking"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.6.9
+    volumes:
+      - ./elasticmq.conf:/opt/elasticmq.conf:ro
+    ports:
+      - "9324:9324"
+
+  api:
+    build: .
+    environment:
+      PORT: "8080"
+      DATABASE_URL: "postgres://banking:banking@postgres:5432/banking?sslmode=disable"
+      SQS_QUEUE_URL: "http://elasticmq:9324/queue/account-events"
+      SQS_DLQ_QUEUE_URL: "http://elasticmq:9324/queue/account-events-dlq"
+      AWS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      AWS_ENDPOINT_URL_SQS: "http://elasticmq:9324"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticmq:
+        condition: service_started
+
+  consumer:
+    build: .
+    entrypoint: ["/consumer"]
+    environment:
+      PORT: "8081"
+      DATABASE_URL: "postgres://banking:banking@postgres:5432/banking?sslmode=disable"
+      SQS_QUEUE_URL: "http://elasticmq:9324/queue/account-events"
+      SQS_DLQ_QUEUE_URL: "http://elasticmq:9324/queue/account-events-dlq"
+      AWS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      AWS_ENDPOINT_URL_SQS: "http://elasticmq:9324"
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticmq:
+        condition: service_started

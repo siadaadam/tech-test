@@ -1,0 +1,38 @@
+# Terraform (terraform/)
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Go (app/)
+/app/api
+/app/consumer
+/app/banking-app
+*.test
+*.out
+
+# Helm (helm/)
+helm/**/charts/
+*.tgz
+
+# Docker
+*.pid
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

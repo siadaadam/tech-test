@@ -1,0 +1,176 @@
+image:
+  # Set to the ECR repository URL output by terraform/modules/ecr.
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  # e.g. eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<irsa-role>
+  # attached to the producer/consumer IAM policies from terraform/modules/sqs.
+  annotations: {}
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Database connection. In a real deployment, database.existingSecret
+# should point at a Secret synced (e.g. by External Secrets Operator) from
+# the Secrets Manager secret created by terraform/modules/rds.
+database:
+  existingSecret: ""
+  existingSecretKey: DATABASE_URL
+  # Only used if existingSecret is empty: creates a Secret from this literal
+  # value. Convenient for local/dev testing against a throwaway database -
+  # do not use this path with real credentials in a committed values file.
+  url: ""
+
+# -- Queue endpoints from terraform/modules/sqs outputs (queue_url, dlq_url).
+sqs:
+  queueUrl: ""
+  dlqUrl: ""
+
+aws:
+  region: ""
+  # Only needed for local/dev brokers (e.g. ElasticMQ) that don't validate
+  # SigV4 credentials; leave unset in real AWS deployments and rely on the
+  # pod's IRSA role instead.
+  endpointUrlSqs: ""
+
+# -- Shared timeouts, in seconds, passed to both the api and consumer.
+env:
+  dbPingTimeoutSeconds: 2
+  shutdownTimeoutSeconds: 20
+
+api:
+  replicaCount: 2
+  port: 8080
+
+  # -- api-only: how long to keep serving after SIGTERM before shutting
+  # down, to cover the endpoint-removal propagation delay. Pair with
+  # api.lifecycle preStop below.
+  shutdownDrainSeconds: 5
+  eventPublishTimeoutSeconds: 2
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    failureThreshold: 3
+
+  # preStop pairs with shutdownDrainSeconds above: give Kubernetes time to
+  # remove this pod from Service endpoints before the process starts its own
+  # drain-then-shutdown sequence.
+  lifecycle:
+    preStop:
+      exec:
+        command: ["sleep", "5"]
+
+  terminationGracePeriodSeconds: 30
+
+  service:
+    type: ClusterIP
+    port: 80
+
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts:
+      - host: banking-app.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+  extraEnv: []
+
+consumer:
+  enabled: true
+  replicaCount: 1
+  port: 8081
+
+  processTimeoutSeconds: 5
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    failureThreshold: 3
+
+  terminationGracePeriodSeconds: 30
+
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+  extraEnv: []
